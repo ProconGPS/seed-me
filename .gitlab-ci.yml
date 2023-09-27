@@ -1,0 +1,178 @@
+workflow:
+  rules:
+  - if: $CI_COMMIT_MESSAGE =~ /.*(\[Release\]|quick-build).*/
+    when: never
+  - if: $CI_COMMIT_AUTHOR =~ /ci-spireon.*/
+    when: never
+  - if: $CI_COMMIT_BRANCH =~ /^(master|main|dev.*|PR.*|release.*|ci-test|feature.*|test)$/
+  - if: $CI_COMMIT_BRANCH =~ '/ci-test/'
+
+cache:
+  key: $CI_PIPELINE_ID
+  paths:
+  - .m2/repository
+  - .sonar/cache
+
+default:
+  tags:
+  - new-aws
+  - new-staging
+
+variables:
+  GIT_SUBMODULE_STRATEGY: recursive
+  PUBLISH_TO_DOCKERHUB: "true"
+  SEMVER_MAIN_BUMP_TYPE: "minor"
+  CI_DEBUG_TRACE: "false"
+
+stages:
+- versioning
+- test
+- scan
+- grails-build
+- docker-build
+
+grails-versioning:
+  stage: versioning 
+  script:
+  - |
+    #!/bin/bash +xe
+
+    git checkout $CI_COMMIT_BRANCH
+    git config --global user.email "devops@spireon.com"
+    git config --global user.name "ci-spireon"
+    git remote set-url origin https://$GH_TOKEN:x-oauth-basic@github.com/ProconGPS/${CI_PROJECT_NAME}
+
+    export GIT_HASH=$(git rev-parse --short HEAD)
+    export GIT_HASH_FULL=$(git rev-parse HEAD)
+    export GIT_COMMIT_DATE=$(git log --pretty=format:%ad -1 --date=format:'%Y-%m-%d %H:%M:%S%z')
+    export GIT_COMMIT_MESSAGE_SHORT=$(git log --pretty=format:%f -1)
+    export GIT_COMMIT_MESSAGE=$(git log --pretty=format:%s -1)
+    export GIT_AUTHOR_NAME=$(git log --pretty=format:%an -1)
+    export GIT_AUTHOR_EMAIL=$(git log --pretty=format:%ae -1)
+    export VERSION=$(awk -F'=' '/app.version/ { print $2 }' application.properties | tr -d '\r\n')
+    export DATE=$(date)
+    export GRAILS_ARGS="-Dspireon.nexus.username=${ORG_GRADLE_PROJECT_NEXUS_USERNAME} -Dspireon.nexus.password=${ORG_GRADLE_PROJECT_NEXUS_PASSWORD}"
+
+    # There are two pipeline runs created for each external pull request:
+    # one for PR itself and one for its source branch
+    # See https://docs.gitlab.com/ee/ci/ci_cd_for_external_repos/#how-it-works
+
+    if [[ -n "$CI_EXTERNAL_PULL_REQUEST_IID" ]]; then
+      export 
+      export CI_VERSION="PR-${CI_EXTERNAL_PULL_REQUEST_IID}-SNAPSHOT"
+      ./grailsw set-version $CI_VERSION $GRAILS_ARGS     
+    elif [[ "$CI_COMMIT_BRANCH" == "main" ]] || [[ "$CI_COMMIT_BRANCH" == "master" ]]; then
+      export CI_VERSION=$(./scripts/semver.sh bump ${SEMVER_MAIN_BUMP_TYPE} ${VERSION})
+      ./grailsw set-version $CI_VERSION $GRAILS_ARGS
+      cat application.properties
+      git add application.properties
+      GIT_TAG=v${CI_VERSION}
+      git tag ${GIT_TAG}
+      git commit -m "[Release] - new version commit 'v${CI_VERSION}'"
+      git push origin $CI_COMMIT_BRANCH
+      git push origin ${GIT_TAG}
+    elif [[ "$CI_COMMIT_BRANCH" == *"release"* ]]; then
+      export CI_VERSION=$(./scripts/semver.sh bump patch ${VERSION})
+      ./grailsw set-version $CI_VERSION $GRAILS_ARGS
+      cat application.properties
+      git add application.properties
+      git commit -m "[Release] - new version commit 'v${CI_VERSION}'"
+      git push origin $CI_COMMIT_BRANCH
+    else
+      export CI_VERSION=$(echo "${CI_COMMIT_REF_SLUG}-SNAPSHOT" | sed 's/\//\-/g')
+      ./grailsw set-version $CI_VERSION $GRAILS_ARGS
+    fi
+
+    # inject git commit details to application.properties for actuator info
+    FILE_CONTENTS=$(sed '/git/d' application.properties)
+    cat << EOF > application.properties
+    ${FILE_CONTENTS}
+    # git details for actuator info
+    git.commit.message.short=${GIT_COMMIT_MESSAGE_SHORT}
+    git.commit.message=${GIT_COMMIT_MESSAGE}
+    git.user.name=${GIT_AUTHOR_NAME}
+    git.user.email=${GIT_AUTHOR_EMAIL}
+    git.id.abbrev=${GIT_HASH}
+    git.id.full=${GIT_HASH_FULL}
+    git.time=${GIT_COMMIT_DATE}
+    git.branch=${CI_COMMIT_BRANCH}
+    EOF
+
+    cat << EOF > web-app/build_tag
+    Build Name: ${CI_JOB_NAME}
+    Build Number: ${CI_PIPELINE_IID}
+    Git Branch/Tag Name: ${CI_COMMIT_BRANCH}
+    Last Commit: ${GIT_HASH}
+    Timestamp: ${DATE}
+    Version: ${CI_VERSION}
+    EOF
+
+    cat << EOF > build.env
+    CI_VERSION=${CI_VERSION}
+    EOF
+
+    cat application.properties
+    cat web-app/build_tag
+
+  artifacts:
+    paths:
+    - application.properties
+    - web-app/build_tag
+    reports:
+      dotenv: build.env
+    expire_in: 1 day
+
+grails-test:
+  stage: test
+  script:
+  - ./grailsw test-app -Xlint:unchecked --refresh-dependencies --non-interactive --unit -coverage -xml -Dspireon.nexus.username=${ORG_GRADLE_PROJECT_NEXUS_USERNAME} -Dspireon.nexus.password="${ORG_GRADLE_PROJECT_NEXUS_PASSWORD}"
+  artifacts:
+    when: always
+    reports:
+      junit: '**/target/test-reports/TEST-*.xml'
+      coverage_report:
+        coverage_format: cobertura
+        path: '**/target/test-reports/cobertura/coverage.xml'
+    paths:
+    - '**/target/test-reports/cobertura/*'
+    - '**/target/test-reports/*.xml'
+    expire_in: 1 month
+  allow_failure: false 
+
+grails-build:
+  stage: grails-build
+  script:
+  - |
+    #!/bin/bash +xe   
+    export ARTIFACT_VERSION=${CI_VERSION}
+    if [[ "$ARTIFACT_VERSION" == *"-SNAPSHOT" ]]; then export NEXUS_REPO='spireonSnap'; else export NEXUS_REPO='spireonRel'; fi
+    ./grailsw compile -Dspireon.nexus.username=${ORG_GRADLE_PROJECT_NEXUS_USERNAME} -Dspireon.nexus.password=${ORG_GRADLE_PROJECT_NEXUS_PASSWORD}
+    ./grailsw prod maven-deploy --repository=$NEXUS_REPO -Dspireon.nexus.username=${ORG_GRADLE_PROJECT_NEXUS_USERNAME} -Dspireon.nexus.password=${ORG_GRADLE_PROJECT_NEXUS_PASSWORD}
+  artifacts:
+    paths:
+    - 'target/**/*.war'
+    expire_in: 1 day
+
+docker-build:
+  stage: docker-build
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  script:
+  - |
+    #!/bin/bash +xe
+
+    mkdir -p /kaniko/.docker
+    export PROJECT_NAME=$(echo $CI_PROJECT_NAME | tr "[:upper:]" "[:lower:]")
+    export DOCKER_TAG=$(echo $CI_VERSION | tr "[:upper:]" "[:lower:]")
+    export APP_VERSION=$(cat application.properties | grep app.version | cut -f2 -d'=')
+    export GIT_HASH=$CI_COMMIT_SHORT_SHA
+    echo "{\"auths\":{\"$CI_REGISTRY\":{\"auth\":\"$(echo -n ${CI_REGISTRY_USER}:${CI_REGISTRY_PASSWORD} | base64)\"},\"https://index.docker.io/v1/\":{\"auth\":\"$(echo -n $ORG_GRADLE_PROJECT_DOCKER_USERNAME:$ORG_GRADLE_PROJECT_DOCKER_PASSWORD | base64)\"}}}" > /kaniko/.docker/config.json
+    DESTINATIONS="$DESTINATIONS --destination spireon/${PROJECT_NAME}:${DOCKER_TAG}"
+    DESTINATIONS="$DESTINATIONS --destination spireon/${PROJECT_NAME}:${APP_VERSION}"
+    DESTINATIONS="$DESTINATIONS --destination spireon/${PROJECT_NAME}:${GIT_HASH}"
+    /kaniko/executor --verbosity warn --context $CI_PROJECT_DIR --dockerfile ${CI_PROJECT_DIR}/Dockerfile $DESTINATIONS
+
+  rules:
+  - if: $PUBLISH_TO_DOCKERHUB == "true"
+
