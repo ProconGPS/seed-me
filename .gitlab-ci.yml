@@ -5,13 +5,8 @@ workflow:
   - if: $CI_COMMIT_AUTHOR =~ /ci-spireon.*/
     when: never
   - if: $CI_PIPELINE_SOURCE == "external_pull_request_event"
-  - if: $CI_COMMIT_BRANCH =~ /(citest*|master|main|dev.*|PR.*|release.*|test)/
-
-cache:
-  key: $CI_COMMIT_BRANCH
-  paths:
-  - .m2/repository
-  - .sonar/cache
+  - if: $CI_PIPELINE_SOURCE == "web"
+  - if: $CI_COMMIT_BRANCH =~ /(ci-test|master|main|dev.*|PR.*|release.*|test)/
   
 include:
 - project: spireon/devops/cicd/include-files
@@ -23,8 +18,5 @@ default:
   image: registry.gitlab.com/spireon/devops/cicd/docker/java8builder:master
 
 variables:
-  GIT_SUBMODULE_STRATEGY: recursive
-  PUBLISH_TO_DOCKERHUB: "false"
-  PUBLISH_TO_GITLAB_CONTAINER_REGISTRY: "false"
-  PUBLISH_TO_GITLAB_PACKAGE_REGISTRY: "false"
-  SEMVER_MAIN_BUMP_TYPE: "patch"
+  PUBLISH_TO_NEXUS: "false"
+
